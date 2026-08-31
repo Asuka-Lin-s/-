@@ -5,6 +5,8 @@
 // This repository copy corresponds to the frameless Win32 build with four-edge auto-hide.
 
 #include <windows.h>
+#include <windowsx.h>
+#include <stdlib.h>
 
 #define ID_EDIT 1001
 #define IDM_TOPMOST 2001
