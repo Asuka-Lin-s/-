@@ -1,16 +1,16 @@
 // EdgeNote - native Win32 sticky note for Windows 10/11 x64
-// True borderless window, manual resize, four-edge auto-hide, multi-instance,
-// per-note preset/custom colors.
+// True borderless window, manual resize, four-edge auto-hide,
+// multiple editable notes in one process, per-note colors.
 
 #include <windows.h>
 #include <windowsx.h>
 #include <commdlg.h>
 #include <stdlib.h>
-#include <wchar.h>
 
 #pragma comment(lib, "Comdlg32.lib")
 
 #define ID_EDIT 1001
+
 #define IDM_NEWNOTE 2000
 #define IDM_TOPMOST 2001
 #define IDM_AUTOHIDE 2002
@@ -29,11 +29,17 @@
 #define IDM_COLOR_CUSTOM 2110
 
 #define TIMER_EDGE 1
+
 #define EDGE_NONE 0
 #define EDGE_LEFT 1
 #define EDGE_RIGHT 2
 #define EDGE_TOP 3
 #define EDGE_BOTTOM 4
+
+#define DRAG_NONE 0
+#define DRAG_MOVE 1
+#define DRAG_SIZE 2
+
 #define SNAP_DISTANCE 32
 #define HIDDEN_SLIVER 4
 #define EDGE_TRIGGER 3
@@ -43,11 +49,6 @@
 #define TITLE_H 34
 #define RESIZE_BORDER 7
 #define TITLE_BTN_W 38
-
-#define DRAG_NONE 0
-#define DRAG_MOVE 1
-#define DRAG_SIZE 2
-
 #define COLOR_PRESET_COUNT 6
 
 typedef struct NoteColorPreset {
@@ -55,58 +56,51 @@ typedef struct NoteColorPreset {
     COLORREF title;
 } NoteColorPreset;
 
+typedef struct NoteState {
+    HWND hwnd;
+    HWND edit;
+    HBRUSH bodyBrush;
+    HBRUSH titleBrush;
+    HFONT editFont;
+
+    RECT visibleRect;
+    int dockEdge;
+    int hidden;
+    int hideCounter;
+    int alwaysOnTop;
+    int autoHide;
+    int fontSize;
+    int inMoveSize;
+    int menuOpen;
+
+    int dragMode;
+    int dragHit;
+    POINT dragStart;
+    RECT dragRect;
+
+    int colorIndex;
+    COLORREF bodyColor;
+    COLORREF titleColor;
+    COLORREF textColor;
+    COLORREF titleTextColor;
+    COLORREF customColors[16];
+} NoteState;
+
 static const NoteColorPreset g_presets[COLOR_PRESET_COUNT] = {
-    { RGB(247,229,142), RGB(228,201, 85) }, /* yellow */
-    { RGB(250,213,225), RGB(232,169,193) }, /* pink */
-    { RGB(211,231,250), RGB(154,194,232) }, /* blue */
-    { RGB(216,240,211), RGB(160,208,151) }, /* green */
-    { RGB(231,216,248), RGB(191,159,226) }, /* purple */
-    { RGB(252,224,190), RGB(235,181,113) }  /* orange */
+    { RGB(247,229,142), RGB(228,201, 85) },
+    { RGB(250,213,225), RGB(232,169,193) },
+    { RGB(211,231,250), RGB(154,194,232) },
+    { RGB(216,240,211), RGB(160,208,151) },
+    { RGB(231,216,248), RGB(191,159,226) },
+    { RGB(252,224,190), RGB(235,181,113) }
 };
 
-static HWND g_hwnd = NULL;
-static HWND g_edit = NULL;
-static HBRUSH g_bodyBrush = NULL;
-static HBRUSH g_titleBrush = NULL;
-static HFONT g_editFont = NULL;
-static RECT g_visibleRect = {0};
-static int g_dockEdge = EDGE_NONE;
-static int g_hidden = 0;
-static int g_hideCounter = 0;
-static int g_alwaysOnTop = 1;
-static int g_autoHide = 1;
-static int g_fontSize = 13;
-static int g_inMoveSize = 0;
-static int g_menuOpen = 0;
-static int g_spawnCount = 0;
+static HINSTANCE g_instance = NULL;
+static int g_noteCount = 0;
+static int g_nextColor = 1;
 
-static int g_dragMode = DRAG_NONE;
-static int g_dragHit = HTCLIENT;
-static POINT g_dragStart = {0};
-static RECT g_dragRect = {0};
-
-static int g_colorIndex = 0; /* -1 means custom */
-static COLORREF g_bodyColor = RGB(247,229,142);
-static COLORREF g_titleColor = RGB(228,201,85);
-static COLORREF g_textColor = RGB(47,44,30);
-static COLORREF g_titleTextColor = RGB(81,71,17);
-static COLORREF g_customColors[16] = {0};
-
-static void get_monitor_info(HMONITOR mon, MONITORINFO *mi) {
-    ZeroMemory(mi, sizeof(*mi));
-    mi->cbSize = sizeof(*mi);
-    GetMonitorInfoW(mon, mi);
-}
-
-static HMONITOR monitor_for_visible_rect(void) {
-    POINT p;
-    p.x = (g_visibleRect.left + g_visibleRect.right) / 2;
-    p.y = (g_visibleRect.top + g_visibleRect.bottom) / 2;
-    return MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
-}
-
-static HWND z_after(void) {
-    return g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
+static NoteState *note_from(HWND hwnd) {
+    return (NoteState *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
 }
 
 static COLORREF contrast_text(COLORREF c) {
@@ -118,154 +112,191 @@ static COLORREF contrast_text(COLORREF c) {
 }
 
 static COLORREF darken_color(COLORREF c) {
-    int r = (GetRValue(c) * 82) / 100;
-    int g = (GetGValue(c) * 82) / 100;
-    int b = (GetBValue(c) * 82) / 100;
-    return RGB(r, g, b);
+    return RGB(
+        (GetRValue(c) * 82) / 100,
+        (GetGValue(c) * 82) / 100,
+        (GetBValue(c) * 82) / 100
+    );
 }
 
-static void assign_preset_values(int index) {
+static void apply_preset_values(NoteState *n, int index) {
     if (index < 0 || index >= COLOR_PRESET_COUNT) index = 0;
-    g_colorIndex = index;
-    g_bodyColor = g_presets[index].body;
-    g_titleColor = g_presets[index].title;
-    g_textColor = contrast_text(g_bodyColor);
-    g_titleTextColor = contrast_text(g_titleColor);
+    n->colorIndex = index;
+    n->bodyColor = g_presets[index].body;
+    n->titleColor = g_presets[index].title;
+    n->textColor = contrast_text(n->bodyColor);
+    n->titleTextColor = contrast_text(n->titleColor);
 }
 
-static void rebuild_color_brushes(void) {
-    HBRUSH newBody = CreateSolidBrush(g_bodyColor);
-    HBRUSH newTitle = CreateSolidBrush(g_titleColor);
-    if (!newBody || !newTitle) {
-        if (newBody) DeleteObject(newBody);
-        if (newTitle) DeleteObject(newTitle);
+static void get_monitor_info_for(HMONITOR mon, MONITORINFO *mi) {
+    ZeroMemory(mi, sizeof(*mi));
+    mi->cbSize = sizeof(*mi);
+    GetMonitorInfoW(mon, mi);
+}
+
+static HMONITOR monitor_for_note(NoteState *n) {
+    POINT p;
+    p.x = (n->visibleRect.left + n->visibleRect.right) / 2;
+    p.y = (n->visibleRect.top + n->visibleRect.bottom) / 2;
+    return MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
+}
+
+static HWND z_after(NoteState *n) {
+    return n->alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
+}
+
+static void rebuild_brushes(NoteState *n) {
+    HBRUSH body = CreateSolidBrush(n->bodyColor);
+    HBRUSH title = CreateSolidBrush(n->titleColor);
+    HBRUSH oldBody;
+    HBRUSH oldTitle;
+
+    if (!body || !title) {
+        if (body) DeleteObject(body);
+        if (title) DeleteObject(title);
         return;
     }
 
-    HBRUSH oldBody = g_bodyBrush;
-    HBRUSH oldTitle = g_titleBrush;
-    g_bodyBrush = newBody;
-    g_titleBrush = newTitle;
+    oldBody = n->bodyBrush;
+    oldTitle = n->titleBrush;
+    n->bodyBrush = body;
+    n->titleBrush = title;
 
-    if (g_hwnd) {
-        SetClassLongPtrW(g_hwnd, GCLP_HBRBACKGROUND, (LONG_PTR)g_bodyBrush);
-        InvalidateRect(g_hwnd, NULL, TRUE);
-        if (g_edit) InvalidateRect(g_edit, NULL, TRUE);
-    }
+    if (n->hwnd) InvalidateRect(n->hwnd, NULL, TRUE);
+    if (n->edit) InvalidateRect(n->edit, NULL, TRUE);
 
     if (oldBody) DeleteObject(oldBody);
     if (oldTitle) DeleteObject(oldTitle);
 }
 
-static void set_preset_color(int index) {
-    assign_preset_values(index);
-    rebuild_color_brushes();
+static void set_preset_color(NoteState *n, int index) {
+    apply_preset_values(n, index);
+    rebuild_brushes(n);
 }
 
-static void set_custom_color(COLORREF body) {
-    g_colorIndex = -1;
-    g_bodyColor = body;
-    g_titleColor = darken_color(body);
-    g_textColor = contrast_text(g_bodyColor);
-    g_titleTextColor = contrast_text(g_titleColor);
-    rebuild_color_brushes();
+static void set_custom_color(NoteState *n, COLORREF body) {
+    n->colorIndex = -1;
+    n->bodyColor = body;
+    n->titleColor = darken_color(body);
+    n->textColor = contrast_text(n->bodyColor);
+    n->titleTextColor = contrast_text(n->titleColor);
+    rebuild_brushes(n);
 }
 
-static void choose_custom_color(HWND owner) {
+static void choose_custom_color(NoteState *n) {
     CHOOSECOLORW cc;
     ZeroMemory(&cc, sizeof(cc));
     cc.lStructSize = sizeof(cc);
-    cc.hwndOwner = owner;
-    cc.rgbResult = g_bodyColor;
-    cc.lpCustColors = g_customColors;
+    cc.hwndOwner = n->hwnd;
+    cc.rgbResult = n->bodyColor;
+    cc.lpCustColors = n->customColors;
     cc.Flags = CC_FULLOPEN | CC_RGBINIT;
 
-    g_menuOpen = 1;
-    if (ChooseColorW(&cc)) set_custom_color(cc.rgbResult);
-    g_menuOpen = 0;
+    n->menuOpen = 1;
+    if (ChooseColorW(&cc)) set_custom_color(n, cc.rgbResult);
+    n->menuOpen = 0;
 }
 
-static void update_font(void) {
-    HDC dc = GetDC(g_hwnd);
-    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
-    if (dc) ReleaseDC(g_hwnd, dc);
+static void update_font(NoteState *n) {
+    HDC dc;
+    int dpi;
+    HFONT f;
 
-    HFONT f = CreateFontW(
-        -MulDiv(g_fontSize, dpi, 72), 0, 0, 0, FW_NORMAL,
+    dc = GetDC(n->hwnd);
+    dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
+    if (dc) ReleaseDC(n->hwnd, dc);
+
+    f = CreateFontW(
+        -MulDiv(n->fontSize, dpi, 72), 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
         L"Microsoft YaHei UI"
     );
+
     if (f) {
-        SendMessageW(g_edit, WM_SETFONT, (WPARAM)f, TRUE);
-        if (g_editFont) DeleteObject(g_editFont);
-        g_editFont = f;
+        SendMessageW(n->edit, WM_SETFONT, (WPARAM)f, TRUE);
+        if (n->editFont) DeleteObject(n->editFont);
+        n->editFont = f;
     }
 }
 
-static void layout_edit(void) {
-    if (!g_edit) return;
+static void layout_edit(NoteState *n) {
     RECT cr;
-    GetClientRect(g_hwnd, &cr);
-    int pad = RESIZE_BORDER;
-    int ew = cr.right - pad * 2;
-    int eh = cr.bottom - TITLE_H - pad;
+    int pad;
+    int ew;
+    int eh;
+
+    if (!n->edit) return;
+    GetClientRect(n->hwnd, &cr);
+
+    pad = RESIZE_BORDER;
+    ew = cr.right - pad * 2;
+    eh = cr.bottom - TITLE_H - pad;
     if (ew < 1) ew = 1;
     if (eh < 1) eh = 1;
-    MoveWindow(g_edit, pad, TITLE_H, ew, eh, TRUE);
+
+    MoveWindow(n->edit, pad, TITLE_H, ew, eh, TRUE);
 }
 
-static void place_visible_for_dock(void) {
+static void place_visible_for_dock(NoteState *n) {
     MONITORINFO mi;
-    get_monitor_info(monitor_for_visible_rect(), &mi);
+    int w;
+    int h;
+    int x;
+    int y;
 
-    int w = g_visibleRect.right - g_visibleRect.left;
-    int h = g_visibleRect.bottom - g_visibleRect.top;
-    int x = g_visibleRect.left;
-    int y = g_visibleRect.top;
+    get_monitor_info_for(monitor_for_note(n), &mi);
+    w = n->visibleRect.right - n->visibleRect.left;
+    h = n->visibleRect.bottom - n->visibleRect.top;
+    x = n->visibleRect.left;
+    y = n->visibleRect.top;
 
-    if (g_dockEdge == EDGE_LEFT) x = mi.rcWork.left;
-    else if (g_dockEdge == EDGE_RIGHT) x = mi.rcWork.right - w;
-    else if (g_dockEdge == EDGE_TOP) y = mi.rcWork.top;
-    else if (g_dockEdge == EDGE_BOTTOM) y = mi.rcWork.bottom - h;
+    if (n->dockEdge == EDGE_LEFT) x = mi.rcWork.left;
+    else if (n->dockEdge == EDGE_RIGHT) x = mi.rcWork.right - w;
+    else if (n->dockEdge == EDGE_TOP) y = mi.rcWork.top;
+    else if (n->dockEdge == EDGE_BOTTOM) y = mi.rcWork.bottom - h;
 
-    SetWindowPos(g_hwnd, z_after(), x, y, w, h,
+    SetWindowPos(n->hwnd, z_after(n), x, y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    GetWindowRect(g_hwnd, &g_visibleRect);
+    GetWindowRect(n->hwnd, &n->visibleRect);
 }
 
-static void show_from_edge(void) {
-    if (!g_hidden) return;
-    place_visible_for_dock();
-    g_hidden = 0;
-    g_hideCounter = 0;
+static void show_from_edge(NoteState *n) {
+    if (!n->hidden) return;
+    place_visible_for_dock(n);
+    n->hidden = 0;
+    n->hideCounter = 0;
 }
 
-static void hide_to_edge(void) {
-    if (g_dockEdge == EDGE_NONE || !g_autoHide) return;
-
+static void hide_to_edge(NoteState *n) {
     MONITORINFO mi;
-    get_monitor_info(monitor_for_visible_rect(), &mi);
+    int w;
+    int h;
+    int x;
+    int y;
 
-    int w = g_visibleRect.right - g_visibleRect.left;
-    int h = g_visibleRect.bottom - g_visibleRect.top;
-    int x = g_visibleRect.left;
-    int y = g_visibleRect.top;
+    if (n->dockEdge == EDGE_NONE || !n->autoHide) return;
 
-    if (g_dockEdge == EDGE_LEFT)
+    get_monitor_info_for(monitor_for_note(n), &mi);
+    w = n->visibleRect.right - n->visibleRect.left;
+    h = n->visibleRect.bottom - n->visibleRect.top;
+    x = n->visibleRect.left;
+    y = n->visibleRect.top;
+
+    if (n->dockEdge == EDGE_LEFT)
         x = mi.rcMonitor.left - w + HIDDEN_SLIVER;
-    else if (g_dockEdge == EDGE_RIGHT)
+    else if (n->dockEdge == EDGE_RIGHT)
         x = mi.rcMonitor.right - HIDDEN_SLIVER;
-    else if (g_dockEdge == EDGE_TOP)
+    else if (n->dockEdge == EDGE_TOP)
         y = mi.rcMonitor.top - h + HIDDEN_SLIVER;
-    else if (g_dockEdge == EDGE_BOTTOM)
+    else if (n->dockEdge == EDGE_BOTTOM)
         y = mi.rcMonitor.bottom - HIDDEN_SLIVER;
 
-    SetWindowPos(g_hwnd, z_after(), x, y, w, h,
+    SetWindowPos(n->hwnd, z_after(n), x, y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    g_hidden = 1;
-    g_hideCounter = 0;
+    n->hidden = 1;
+    n->hideCounter = 0;
 }
 
 static int point_in_rect_margin(POINT p, RECT r, int margin) {
@@ -273,74 +304,79 @@ static int point_in_rect_margin(POINT p, RECT r, int margin) {
            p.y >= r.top - margin && p.y <= r.bottom + margin;
 }
 
-static void edge_timer(void) {
-    if (g_dockEdge == EDGE_NONE || !g_autoHide || g_inMoveSize || g_menuOpen)
-        return;
-
+static void edge_timer(NoteState *n) {
     POINT p;
+    MONITORINFO mi;
+
+    if (n->dockEdge == EDGE_NONE || !n->autoHide || n->inMoveSize || n->menuOpen)
+        return;
     if (!GetCursorPos(&p)) return;
 
-    MONITORINFO mi;
-    get_monitor_info(monitor_for_visible_rect(), &mi);
+    get_monitor_info_for(monitor_for_note(n), &mi);
 
-    if (g_hidden) {
+    if (n->hidden) {
         int hit = 0;
-        if (g_dockEdge == EDGE_LEFT &&
+        if (n->dockEdge == EDGE_LEFT &&
             p.x <= mi.rcMonitor.left + EDGE_TRIGGER &&
-            p.y >= g_visibleRect.top - 20 && p.y <= g_visibleRect.bottom + 20)
+            p.y >= n->visibleRect.top - 20 && p.y <= n->visibleRect.bottom + 20)
             hit = 1;
-        else if (g_dockEdge == EDGE_RIGHT &&
+        else if (n->dockEdge == EDGE_RIGHT &&
                  p.x >= mi.rcMonitor.right - 1 - EDGE_TRIGGER &&
-                 p.y >= g_visibleRect.top - 20 && p.y <= g_visibleRect.bottom + 20)
+                 p.y >= n->visibleRect.top - 20 && p.y <= n->visibleRect.bottom + 20)
             hit = 1;
-        else if (g_dockEdge == EDGE_TOP &&
+        else if (n->dockEdge == EDGE_TOP &&
                  p.y <= mi.rcMonitor.top + EDGE_TRIGGER &&
-                 p.x >= g_visibleRect.left - 20 && p.x <= g_visibleRect.right + 20)
+                 p.x >= n->visibleRect.left - 20 && p.x <= n->visibleRect.right + 20)
             hit = 1;
-        else if (g_dockEdge == EDGE_BOTTOM &&
+        else if (n->dockEdge == EDGE_BOTTOM &&
                  p.y >= mi.rcMonitor.bottom - 1 - EDGE_TRIGGER &&
-                 p.x >= g_visibleRect.left - 20 && p.x <= g_visibleRect.right + 20)
+                 p.x >= n->visibleRect.left - 20 && p.x <= n->visibleRect.right + 20)
             hit = 1;
 
-        if (hit) show_from_edge();
+        if (hit) show_from_edge(n);
     } else {
         RECT r;
-        GetWindowRect(g_hwnd, &r);
+        GetWindowRect(n->hwnd, &r);
         if (!point_in_rect_margin(p, r, 8)) {
-            if (++g_hideCounter >= HIDE_TICKS) hide_to_edge();
+            if (++n->hideCounter >= HIDE_TICKS) hide_to_edge(n);
         } else {
-            g_hideCounter = 0;
+            n->hideCounter = 0;
         }
     }
 }
 
-static void detect_and_snap(void) {
+static void detect_and_snap(NoteState *n) {
     RECT r;
-    GetWindowRect(g_hwnd, &r);
-
     POINT center;
+    MONITORINFO mi;
+    int dl;
+    int dr;
+    int dt;
+    int db;
+    int best;
+    int edge;
+
+    GetWindowRect(n->hwnd, &r);
     center.x = (r.left + r.right) / 2;
     center.y = (r.top + r.bottom) / 2;
+    get_monitor_info_for(MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST), &mi);
 
-    MONITORINFO mi;
-    get_monitor_info(MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST), &mi);
-
-    int dl = abs(r.left - mi.rcWork.left);
-    int dr = abs(mi.rcWork.right - r.right);
-    int dt = abs(r.top - mi.rcWork.top);
-    int db = abs(mi.rcWork.bottom - r.bottom);
-    int best = SNAP_DISTANCE + 1;
-    int edge = EDGE_NONE;
+    dl = abs(r.left - mi.rcWork.left);
+    dr = abs(mi.rcWork.right - r.right);
+    dt = abs(r.top - mi.rcWork.top);
+    db = abs(mi.rcWork.bottom - r.bottom);
+    best = SNAP_DISTANCE + 1;
+    edge = EDGE_NONE;
 
     if (dl < best) { best = dl; edge = EDGE_LEFT; }
     if (dr < best) { best = dr; edge = EDGE_RIGHT; }
     if (dt < best) { best = dt; edge = EDGE_TOP; }
     if (db < best) { best = db; edge = EDGE_BOTTOM; }
 
-    g_dockEdge = edge;
-    g_hidden = 0;
-    g_visibleRect = r;
-    if (edge != EDGE_NONE) place_visible_for_dock();
+    n->dockEdge = edge;
+    n->hidden = 0;
+    n->visibleRect = r;
+    if (edge != EDGE_NONE) place_visible_for_dock(n);
 }
 
 static int resize_hit_test(int x, int y, int w, int h) {
@@ -360,346 +396,476 @@ static int resize_hit_test(int x, int y, int w, int h) {
     return HTCLIENT;
 }
 
-static void begin_drag(int mode, int hit) {
-    g_dragMode = mode;
-    g_dragHit = hit;
-    g_inMoveSize = 1;
-    g_hidden = 0;
-    g_dockEdge = EDGE_NONE;
-    GetCursorPos(&g_dragStart);
-    GetWindowRect(g_hwnd, &g_dragRect);
-    SetCapture(g_hwnd);
+static void begin_drag(NoteState *n, int mode, int hit) {
+    n->dragMode = mode;
+    n->dragHit = hit;
+    n->inMoveSize = 1;
+    n->hidden = 0;
+    n->dockEdge = EDGE_NONE;
+    GetCursorPos(&n->dragStart);
+    GetWindowRect(n->hwnd, &n->dragRect);
+    SetCapture(n->hwnd);
 }
 
-static void apply_drag(void) {
-    if (g_dragMode == DRAG_NONE) return;
-
+static void apply_drag(NoteState *n) {
     POINT p;
-    GetCursorPos(&p);
-    int dx = p.x - g_dragStart.x;
-    int dy = p.y - g_dragStart.y;
-    RECT r = g_dragRect;
+    int dx;
+    int dy;
+    RECT r;
 
-    if (g_dragMode == DRAG_MOVE) {
+    if (n->dragMode == DRAG_NONE) return;
+
+    GetCursorPos(&p);
+    dx = p.x - n->dragStart.x;
+    dy = p.y - n->dragStart.y;
+    r = n->dragRect;
+
+    if (n->dragMode == DRAG_MOVE) {
         OffsetRect(&r, dx, dy);
     } else {
-        if (g_dragHit == HTLEFT || g_dragHit == HTTOPLEFT || g_dragHit == HTBOTTOMLEFT)
+        if (n->dragHit == HTLEFT || n->dragHit == HTTOPLEFT || n->dragHit == HTBOTTOMLEFT)
             r.left += dx;
-        if (g_dragHit == HTRIGHT || g_dragHit == HTTOPRIGHT || g_dragHit == HTBOTTOMRIGHT)
+        if (n->dragHit == HTRIGHT || n->dragHit == HTTOPRIGHT || n->dragHit == HTBOTTOMRIGHT)
             r.right += dx;
-        if (g_dragHit == HTTOP || g_dragHit == HTTOPLEFT || g_dragHit == HTTOPRIGHT)
+        if (n->dragHit == HTTOP || n->dragHit == HTTOPLEFT || n->dragHit == HTTOPRIGHT)
             r.top += dy;
-        if (g_dragHit == HTBOTTOM || g_dragHit == HTBOTTOMLEFT || g_dragHit == HTBOTTOMRIGHT)
+        if (n->dragHit == HTBOTTOM || n->dragHit == HTBOTTOMLEFT || n->dragHit == HTBOTTOMRIGHT)
             r.bottom += dy;
 
         if (r.right - r.left < MIN_W) {
-            if (g_dragHit == HTLEFT || g_dragHit == HTTOPLEFT || g_dragHit == HTBOTTOMLEFT)
+            if (n->dragHit == HTLEFT || n->dragHit == HTTOPLEFT || n->dragHit == HTBOTTOMLEFT)
                 r.left = r.right - MIN_W;
             else
                 r.right = r.left + MIN_W;
         }
+
         if (r.bottom - r.top < MIN_H) {
-            if (g_dragHit == HTTOP || g_dragHit == HTTOPLEFT || g_dragHit == HTTOPRIGHT)
+            if (n->dragHit == HTTOP || n->dragHit == HTTOPLEFT || n->dragHit == HTTOPRIGHT)
                 r.top = r.bottom - MIN_H;
             else
                 r.bottom = r.top + MIN_H;
         }
     }
 
-    SetWindowPos(g_hwnd, z_after(), r.left, r.top,
+    SetWindowPos(n->hwnd, z_after(n), r.left, r.top,
                  r.right - r.left, r.bottom - r.top,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
-static void end_drag(void) {
-    if (g_dragMode == DRAG_NONE) return;
+static void end_drag(NoteState *n) {
+    if (n->dragMode == DRAG_NONE) return;
+
     ReleaseCapture();
-    g_dragMode = DRAG_NONE;
-    g_dragHit = HTCLIENT;
-    g_inMoveSize = 0;
-    GetWindowRect(g_hwnd, &g_visibleRect);
-    detect_and_snap();
+    n->dragMode = DRAG_NONE;
+    n->dragHit = HTCLIENT;
+    n->inMoveSize = 0;
+    GetWindowRect(n->hwnd, &n->visibleRect);
+    detect_and_snap(n);
 }
 
-static void create_new_note(void) {
-    WCHAR exe[MAX_PATH];
-    WCHAR command[MAX_PATH * 2];
-    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
+static HWND create_note(NoteState *from, int colorIndex) {
+    NoteState *n;
+    HWND hwnd;
+    int x = 1100;
+    int y = 180;
+    int w = 360;
+    int h = 430;
 
-    int base = g_colorIndex >= 0 ? g_colorIndex : ((int)GetCurrentProcessId() % COLOR_PRESET_COUNT);
-    int nextColor = (base + 1 + g_spawnCount) % COLOR_PRESET_COUNT;
-    int offset = (g_spawnCount + 1) % 8;
-    ++g_spawnCount;
+    n = (NoteState *)calloc(1, sizeof(NoteState));
+    if (!n) return NULL;
 
-    wsprintfW(command, L"\"%s\" /color=%d /offset=%d", exe, nextColor, offset);
+    n->dockEdge = EDGE_NONE;
+    n->alwaysOnTop = 1;
+    n->autoHide = 1;
+    n->fontSize = 13;
+    n->dragHit = HTCLIENT;
+    apply_preset_values(n, colorIndex);
 
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    ZeroMemory(&pi, sizeof(pi));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOWNORMAL;
+    if (from && from->hwnd) {
+        RECT r;
+        MONITORINFO mi;
+        POINT center;
+        GetWindowRect(from->hwnd, &r);
+        w = r.right - r.left;
+        h = r.bottom - r.top;
+        x = r.left + 28;
+        y = r.top + 28;
 
-    if (CreateProcessW(exe, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        AllowSetForegroundWindow(pi.dwProcessId);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+        center.x = (r.left + r.right) / 2;
+        center.y = (r.top + r.bottom) / 2;
+        get_monitor_info_for(MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST), &mi);
+
+        if (x + w > mi.rcWork.right) x = mi.rcWork.left + 24;
+        if (y + h > mi.rcWork.bottom) y = mi.rcWork.top + 24;
     }
+
+    hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        L"EdgeNoteBorderlessClass",
+        L"EdgeNote",
+        WS_POPUP | WS_CLIPCHILDREN,
+        x, y, w, h,
+        NULL, NULL, g_instance, n
+    );
+
+    if (!hwnd) {
+        free(n);
+        return NULL;
+    }
+
+    ++g_noteCount;
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    UpdateWindow(hwnd);
+
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    if (n->edit) {
+        SetFocus(n->edit);
+        SendMessageW(n->edit, EM_SETSEL, 0, 0);
+    }
+
+    return hwnd;
 }
 
-static void show_menu(HWND hwnd) {
-    HMENU menu = CreatePopupMenu();
-    HMENU colors = CreatePopupMenu();
+static void show_menu(NoteState *n) {
+    HMENU menu;
+    HMENU colors;
+    RECT wr;
+    int cmd;
+
+    menu = CreatePopupMenu();
+    colors = CreatePopupMenu();
     if (!menu || !colors) {
         if (menu) DestroyMenu(menu);
         if (colors) DestroyMenu(colors);
         return;
     }
 
-    AppendMenuW(colors, MF_STRING | (g_colorIndex == 0 ? MF_CHECKED : 0), IDM_COLOR_YELLOW, L"黄色");
-    AppendMenuW(colors, MF_STRING | (g_colorIndex == 1 ? MF_CHECKED : 0), IDM_COLOR_PINK,   L"粉色");
-    AppendMenuW(colors, MF_STRING | (g_colorIndex == 2 ? MF_CHECKED : 0), IDM_COLOR_BLUE,   L"蓝色");
-    AppendMenuW(colors, MF_STRING | (g_colorIndex == 3 ? MF_CHECKED : 0), IDM_COLOR_GREEN,  L"绿色");
-    AppendMenuW(colors, MF_STRING | (g_colorIndex == 4 ? MF_CHECKED : 0), IDM_COLOR_PURPLE, L"紫色");
-    AppendMenuW(colors, MF_STRING | (g_colorIndex == 5 ? MF_CHECKED : 0), IDM_COLOR_ORANGE, L"橙色");
+    AppendMenuW(colors, MF_STRING | (n->colorIndex == 0 ? MF_CHECKED : 0), IDM_COLOR_YELLOW, L"黄色");
+    AppendMenuW(colors, MF_STRING | (n->colorIndex == 1 ? MF_CHECKED : 0), IDM_COLOR_PINK, L"粉色");
+    AppendMenuW(colors, MF_STRING | (n->colorIndex == 2 ? MF_CHECKED : 0), IDM_COLOR_BLUE, L"蓝色");
+    AppendMenuW(colors, MF_STRING | (n->colorIndex == 3 ? MF_CHECKED : 0), IDM_COLOR_GREEN, L"绿色");
+    AppendMenuW(colors, MF_STRING | (n->colorIndex == 4 ? MF_CHECKED : 0), IDM_COLOR_PURPLE, L"紫色");
+    AppendMenuW(colors, MF_STRING | (n->colorIndex == 5 ? MF_CHECKED : 0), IDM_COLOR_ORANGE, L"橙色");
     AppendMenuW(colors, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(colors, MF_STRING | (g_colorIndex == -1 ? MF_CHECKED : 0), IDM_COLOR_CUSTOM, L"自定义颜色...");
+    AppendMenuW(colors, MF_STRING | (n->colorIndex == -1 ? MF_CHECKED : 0), IDM_COLOR_CUSTOM, L"自定义颜色...");
 
     AppendMenuW(menu, MF_STRING, IDM_NEWNOTE, L"新建便签");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)colors, L"便签颜色");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (g_alwaysOnTop ? MF_CHECKED : 0), IDM_TOPMOST, L"总在最前");
-    AppendMenuW(menu, MF_STRING | (g_autoHide ? MF_CHECKED : 0), IDM_AUTOHIDE, L"贴边自动隐藏");
+    AppendMenuW(menu, MF_STRING | (n->alwaysOnTop ? MF_CHECKED : 0), IDM_TOPMOST, L"总在最前");
+    AppendMenuW(menu, MF_STRING | (n->autoHide ? MF_CHECKED : 0), IDM_AUTOHIDE, L"贴边自动隐藏");
     AppendMenuW(menu, MF_STRING, IDM_UNDOCK, L"取消贴边");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_FONT_PLUS, L"字体放大");
     AppendMenuW(menu, MF_STRING, IDM_FONT_MINUS, L"字体缩小");
     AppendMenuW(menu, MF_STRING, IDM_CLEAR, L"清空");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"退出此便签");
+    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"关闭此便签");
 
-    RECT wr;
-    GetWindowRect(hwnd, &wr);
-    g_menuOpen = 1;
-    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                             wr.right - TITLE_BTN_W * 2,
-                             wr.top + TITLE_H,
-                             0, hwnd, NULL);
-    g_menuOpen = 0;
+    GetWindowRect(n->hwnd, &wr);
+    n->menuOpen = 1;
+    cmd = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        wr.right - TITLE_BTN_W * 2,
+        wr.top + TITLE_H,
+        0, n->hwnd, NULL
+    );
+    n->menuOpen = 0;
+
     DestroyMenu(menu);
-
-    if (cmd) SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+    if (cmd) SendMessageW(n->hwnd, WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    NoteState *n = note_from(hwnd);
+
+    if (msg == WM_NCCREATE) {
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
+        n = (NoteState *)cs->lpCreateParams;
+        if (!n) return FALSE;
+        n->hwnd = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)n);
+    }
+
     switch (msg) {
     case WM_CREATE:
-        g_edit = CreateWindowExW(
-            0, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+        n->bodyBrush = CreateSolidBrush(n->bodyColor);
+        n->titleBrush = CreateSolidBrush(n->titleColor);
+
+        n->edit = CreateWindowExW(
+            0,
+            L"EDIT",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
             RESIZE_BORDER, TITLE_H, 300, 300,
-            hwnd, (HMENU)ID_EDIT, GetModuleHandleW(NULL), NULL
+            hwnd, (HMENU)ID_EDIT, g_instance, NULL
         );
-        update_font();
+
+        if (!n->edit) return -1;
+
+        SendMessageW(n->edit, EM_SETMARGINS,
+                     EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(5, 5));
+        update_font(n);
         SetTimer(hwnd, TIMER_EDGE, 100, NULL);
+        GetWindowRect(hwnd, &n->visibleRect);
         return 0;
 
     case WM_SETFOCUS:
-        if (g_edit) {
-            SetFocus(g_edit);
-            SendMessageW(g_edit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
-        }
+        if (n && n->edit) SetFocus(n->edit);
         return 0;
 
     case WM_ERASEBKGND:
         return 1;
 
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hwnd, &ps);
-        RECT cr;
-        GetClientRect(hwnd, &cr);
+    case WM_PAINT:
+        if (n) {
+            PAINTSTRUCT ps;
+            HDC dc;
+            RECT cr;
+            RECT tr;
+            RECT title;
+            RECT menuR;
+            RECT closeR;
 
-        FillRect(dc, &cr, g_bodyBrush);
-        RECT tr = {0, 0, cr.right, TITLE_H};
-        FillRect(dc, &tr, g_titleBrush);
+            dc = BeginPaint(hwnd, &ps);
+            GetClientRect(hwnd, &cr);
 
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, g_titleTextColor);
+            FillRect(dc, &cr, n->bodyBrush);
+            tr.left = 0;
+            tr.top = 0;
+            tr.right = cr.right;
+            tr.bottom = TITLE_H;
+            FillRect(dc, &tr, n->titleBrush);
 
-        RECT title = {12, 0, cr.right - TITLE_BTN_W * 2 - 4, TITLE_H};
-        DrawTextW(dc, L"便签", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, n->titleTextColor);
 
-        RECT menuR = {cr.right - TITLE_BTN_W * 2, 0, cr.right - TITLE_BTN_W, TITLE_H};
-        DrawTextW(dc, L"⋯", -1, &menuR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            title.left = 12;
+            title.top = 0;
+            title.right = cr.right - TITLE_BTN_W * 2 - 4;
+            title.bottom = TITLE_H;
+            DrawTextW(dc, L"便签", -1, &title,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT closeR = {cr.right - TITLE_BTN_W, 0, cr.right, TITLE_H};
-        DrawTextW(dc, L"×", -1, &closeR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            menuR.left = cr.right - TITLE_BTN_W * 2;
+            menuR.top = 0;
+            menuR.right = cr.right - TITLE_BTN_W;
+            menuR.bottom = TITLE_H;
+            DrawTextW(dc, L"⋯", -1, &menuR,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
+            closeR.left = cr.right - TITLE_BTN_W;
+            closeR.top = 0;
+            closeR.right = cr.right;
+            closeR.bottom = TITLE_H;
+            DrawTextW(dc, L"×", -1, &closeR,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    case WM_SIZE:
-        layout_edit();
-        InvalidateRect(hwnd, NULL, FALSE);
-        return 0;
-
-    case WM_TIMER:
-        if (wParam == TIMER_EDGE) edge_timer();
-        return 0;
-
-    case WM_LBUTTONDOWN: {
-        int x = GET_X_LPARAM(lParam);
-        int y = GET_Y_LPARAM(lParam);
-        RECT cr;
-        GetClientRect(hwnd, &cr);
-
-        if (y < TITLE_H && x >= cr.right - TITLE_BTN_W * 2)
-            return 0;
-
-        int hit = resize_hit_test(x, y, cr.right, cr.bottom);
-        if (hit != HTCLIENT) {
-            begin_drag(DRAG_SIZE, hit);
-            return 0;
-        }
-
-        if (y < TITLE_H) {
-            begin_drag(DRAG_MOVE, HTCAPTION);
-            return 0;
-        }
-
-        if (g_edit) SetFocus(g_edit);
-        return 0;
-    }
-
-    case WM_MOUSEMOVE:
-        if (g_dragMode != DRAG_NONE) {
-            apply_drag();
-            return 0;
-        }
-        return 0;
-
-    case WM_LBUTTONUP: {
-        if (g_dragMode != DRAG_NONE) {
-            end_drag();
-            return 0;
-        }
-
-        int x = GET_X_LPARAM(lParam);
-        int y = GET_Y_LPARAM(lParam);
-        RECT cr;
-        GetClientRect(hwnd, &cr);
-
-        if (y >= 0 && y < TITLE_H) {
-            if (x >= cr.right - TITLE_BTN_W) {
-                DestroyWindow(hwnd);
-                return 0;
-            }
-            if (x >= cr.right - TITLE_BTN_W * 2) {
-                show_menu(hwnd);
-                return 0;
-            }
-        }
-        return 0;
-    }
-
-    case WM_CAPTURECHANGED:
-        if (g_dragMode != DRAG_NONE) {
-            g_dragMode = DRAG_NONE;
-            g_dragHit = HTCLIENT;
-            g_inMoveSize = 0;
-            GetWindowRect(g_hwnd, &g_visibleRect);
-        }
-        return 0;
-
-    case WM_SETCURSOR: {
-        POINT p;
-        GetCursorPos(&p);
-        ScreenToClient(hwnd, &p);
-        RECT cr;
-        GetClientRect(hwnd, &cr);
-        int hit = resize_hit_test(p.x, p.y, cr.right, cr.bottom);
-        LPCTSTR cur = IDC_ARROW;
-        if (hit == HTLEFT || hit == HTRIGHT) cur = IDC_SIZEWE;
-        else if (hit == HTTOP || hit == HTBOTTOM) cur = IDC_SIZENS;
-        else if (hit == HTTOPLEFT || hit == HTBOTTOMRIGHT) cur = IDC_SIZENWSE;
-        else if (hit == HTTOPRIGHT || hit == HTBOTTOMLEFT) cur = IDC_SIZENESW;
-        SetCursor(LoadCursor(NULL, cur));
-        return TRUE;
-    }
-
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case IDM_NEWNOTE:
-            create_new_note();
-            return 0;
-        case IDM_COLOR_YELLOW:
-            set_preset_color(0);
-            return 0;
-        case IDM_COLOR_PINK:
-            set_preset_color(1);
-            return 0;
-        case IDM_COLOR_BLUE:
-            set_preset_color(2);
-            return 0;
-        case IDM_COLOR_GREEN:
-            set_preset_color(3);
-            return 0;
-        case IDM_COLOR_PURPLE:
-            set_preset_color(4);
-            return 0;
-        case IDM_COLOR_ORANGE:
-            set_preset_color(5);
-            return 0;
-        case IDM_COLOR_CUSTOM:
-            choose_custom_color(hwnd);
-            return 0;
-        case IDM_TOPMOST:
-            g_alwaysOnTop = !g_alwaysOnTop;
-            SetWindowPos(hwnd, z_after(), 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            return 0;
-        case IDM_AUTOHIDE:
-            g_autoHide = !g_autoHide;
-            if (!g_autoHide && g_hidden) show_from_edge();
-            return 0;
-        case IDM_FONT_PLUS:
-            if (g_fontSize < 36) ++g_fontSize;
-            update_font();
-            return 0;
-        case IDM_FONT_MINUS:
-            if (g_fontSize > 8) --g_fontSize;
-            update_font();
-            return 0;
-        case IDM_UNDOCK:
-            if (g_hidden) show_from_edge();
-            g_dockEdge = EDGE_NONE;
-            g_hidden = 0;
-            return 0;
-        case IDM_CLEAR:
-            SetWindowTextW(g_edit, L"");
-            SetFocus(g_edit);
-            return 0;
-        case IDM_EXIT:
-            DestroyWindow(hwnd);
+            EndPaint(hwnd, &ps);
             return 0;
         }
         break;
 
+    case WM_SIZE:
+        if (n) {
+            layout_edit(n);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (n && wParam == TIMER_EDGE) edge_timer(n);
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        if (n) {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+            RECT cr;
+            int hit;
+
+            SetForegroundWindow(hwnd);
+            GetClientRect(hwnd, &cr);
+
+            if (y < TITLE_H && x >= cr.right - TITLE_BTN_W * 2)
+                return 0;
+
+            hit = resize_hit_test(x, y, cr.right, cr.bottom);
+            if (hit != HTCLIENT) {
+                begin_drag(n, DRAG_SIZE, hit);
+                return 0;
+            }
+
+            if (y < TITLE_H) {
+                begin_drag(n, DRAG_MOVE, HTCAPTION);
+                return 0;
+            }
+        }
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (n && n->dragMode != DRAG_NONE) {
+            apply_drag(n);
+            return 0;
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (n) {
+            int x;
+            int y;
+            RECT cr;
+
+            if (n->dragMode != DRAG_NONE) {
+                end_drag(n);
+                return 0;
+            }
+
+            x = GET_X_LPARAM(lParam);
+            y = GET_Y_LPARAM(lParam);
+            GetClientRect(hwnd, &cr);
+
+            if (y >= 0 && y < TITLE_H) {
+                if (x >= cr.right - TITLE_BTN_W) {
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                if (x >= cr.right - TITLE_BTN_W * 2) {
+                    show_menu(n);
+                    return 0;
+                }
+            }
+        }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        if (n && n->dragMode != DRAG_NONE) {
+            n->dragMode = DRAG_NONE;
+            n->dragHit = HTCLIENT;
+            n->inMoveSize = 0;
+            GetWindowRect(hwnd, &n->visibleRect);
+        }
+        return 0;
+
+    case WM_SETCURSOR:
+        if (n) {
+            POINT p;
+            RECT cr;
+            int hit;
+            LPCWSTR cur = IDC_ARROW;
+
+            GetCursorPos(&p);
+            ScreenToClient(hwnd, &p);
+            GetClientRect(hwnd, &cr);
+            hit = resize_hit_test(p.x, p.y, cr.right, cr.bottom);
+
+            if (hit == HTLEFT || hit == HTRIGHT) cur = IDC_SIZEWE;
+            else if (hit == HTTOP || hit == HTBOTTOM) cur = IDC_SIZENS;
+            else if (hit == HTTOPLEFT || hit == HTBOTTOMRIGHT) cur = IDC_SIZENWSE;
+            else if (hit == HTTOPRIGHT || hit == HTBOTTOMLEFT) cur = IDC_SIZENESW;
+
+            SetCursor(LoadCursorW(NULL, cur));
+            return TRUE;
+        }
+        break;
+
+    case WM_COMMAND:
+        if (n) {
+            switch (LOWORD(wParam)) {
+            case IDM_NEWNOTE:
+                create_note(n, g_nextColor);
+                g_nextColor = (g_nextColor + 1) % COLOR_PRESET_COUNT;
+                return 0;
+
+            case IDM_COLOR_YELLOW:
+                set_preset_color(n, 0);
+                return 0;
+            case IDM_COLOR_PINK:
+                set_preset_color(n, 1);
+                return 0;
+            case IDM_COLOR_BLUE:
+                set_preset_color(n, 2);
+                return 0;
+            case IDM_COLOR_GREEN:
+                set_preset_color(n, 3);
+                return 0;
+            case IDM_COLOR_PURPLE:
+                set_preset_color(n, 4);
+                return 0;
+            case IDM_COLOR_ORANGE:
+                set_preset_color(n, 5);
+                return 0;
+            case IDM_COLOR_CUSTOM:
+                choose_custom_color(n);
+                return 0;
+
+            case IDM_TOPMOST:
+                n->alwaysOnTop = !n->alwaysOnTop;
+                SetWindowPos(hwnd, z_after(n), 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                return 0;
+
+            case IDM_AUTOHIDE:
+                n->autoHide = !n->autoHide;
+                if (!n->autoHide && n->hidden) show_from_edge(n);
+                return 0;
+
+            case IDM_FONT_PLUS:
+                if (n->fontSize < 36) ++n->fontSize;
+                update_font(n);
+                return 0;
+
+            case IDM_FONT_MINUS:
+                if (n->fontSize > 8) --n->fontSize;
+                update_font(n);
+                return 0;
+
+            case IDM_UNDOCK:
+                if (n->hidden) show_from_edge(n);
+                n->dockEdge = EDGE_NONE;
+                n->hidden = 0;
+                return 0;
+
+            case IDM_CLEAR:
+                SetWindowTextW(n->edit, L"");
+                SetFocus(n->edit);
+                return 0;
+
+            case IDM_EXIT:
+                DestroyWindow(hwnd);
+                return 0;
+            }
+        }
+        break;
+
     case WM_CTLCOLOREDIT:
-        SetBkColor((HDC)wParam, g_bodyColor);
-        SetTextColor((HDC)wParam, g_textColor);
-        return (LRESULT)g_bodyBrush;
+        if (n && (HWND)lParam == n->edit) {
+            SetBkColor((HDC)wParam, n->bodyColor);
+            SetTextColor((HDC)wParam, n->textColor);
+            return (LRESULT)n->bodyBrush;
+        }
+        break;
 
     case WM_DESTROY:
-        KillTimer(hwnd, TIMER_EDGE);
-        if (g_editFont) {
-            DeleteObject(g_editFont);
-            g_editFont = NULL;
+        if (n) {
+            KillTimer(hwnd, TIMER_EDGE);
+            if (g_noteCount > 0) --g_noteCount;
+            if (g_noteCount == 0) PostQuitMessage(0);
         }
-        PostQuitMessage(0);
+        return 0;
+
+    case WM_NCDESTROY:
+        if (n) {
+            if (n->editFont) DeleteObject(n->editFont);
+            if (n->bodyBrush) DeleteObject(n->bodyBrush);
+            if (n->titleBrush) DeleteObject(n->titleBrush);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            free(n);
+        }
         return 0;
     }
 
@@ -707,71 +873,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show) {
-    (void)hPrev;
-
-    int initialColor = 0;
-    int initialOffset = 0;
-
-    WCHAR *colorArg = wcsstr(cmd, L"/color=");
-    if (colorArg) {
-        initialColor = _wtoi(colorArg + 7);
-        if (initialColor < 0 || initialColor >= COLOR_PRESET_COUNT) initialColor = 0;
-    }
-
-    WCHAR *offsetArg = wcsstr(cmd, L"/offset=");
-    if (offsetArg) {
-        initialOffset = _wtoi(offsetArg + 8);
-        if (initialOffset < 0) initialOffset = 0;
-        if (initialOffset > 8) initialOffset = 8;
-    }
-
-    assign_preset_values(initialColor);
-
-    g_bodyBrush = CreateSolidBrush(g_bodyColor);
-    g_titleBrush = CreateSolidBrush(g_titleColor);
-
     WNDCLASSEXW wc;
+    HWND first;
+
+    (void)hPrev;
+    (void)cmd;
+    (void)show;
+
+    g_instance = hInst;
+
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = g_bodyBrush;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;
     wc.lpszClassName = L"EdgeNoteBorderlessClass";
-    RegisterClassExW(&wc);
 
-    int startX = 1100 + initialOffset * 28;
-    int startY = 180 + initialOffset * 28;
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return 1;
 
-    g_hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        wc.lpszClassName,
-        L"EdgeNote",
-        WS_POPUP | WS_CLIPCHILDREN,
-        startX, startY, 360, 430,
-        NULL, NULL, hInst, NULL
-    );
+    first = create_note(NULL, 0);
+    if (!first) return 1;
 
-    if (!g_hwnd) return 1;
-
-    GetWindowRect(g_hwnd, &g_visibleRect);
-    ShowWindow(g_hwnd, SW_SHOWNORMAL);
-    UpdateWindow(g_hwnd);
-
-    SetForegroundWindow(g_hwnd);
-    SetActiveWindow(g_hwnd);
-    if (g_edit) {
-        SetFocus(g_edit);
-        SendMessageW(g_edit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
-    }
-
-    MSG m;
-    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+    while (1) {
+        MSG m;
+        int r = GetMessageW(&m, NULL, 0, 0);
+        if (r <= 0) break;
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
 
-    if (g_bodyBrush) DeleteObject(g_bodyBrush);
-    if (g_titleBrush) DeleteObject(g_titleBrush);
     return 0;
 }
