@@ -428,17 +428,21 @@ static void create_new_note(void) {
 
     int base = g_colorIndex >= 0 ? g_colorIndex : ((int)GetCurrentProcessId() % COLOR_PRESET_COUNT);
     int nextColor = (base + 1 + g_spawnCount) % COLOR_PRESET_COUNT;
+    int offset = (g_spawnCount + 1) % 8;
     ++g_spawnCount;
 
-    wsprintfW(command, L"\"%s\" /color=%d", exe, nextColor);
+    wsprintfW(command, L"\"%s\" /color=%d /offset=%d", exe, nextColor, offset);
 
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
     ZeroMemory(&pi, sizeof(pi));
     si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_SHOWNORMAL;
 
     if (CreateProcessW(exe, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        AllowSetForegroundWindow(pi.dwProcessId);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
@@ -493,12 +497,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CREATE:
         g_edit = CreateWindowExW(
             0, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
             RESIZE_BORDER, TITLE_H, 300, 300,
             hwnd, (HMENU)ID_EDIT, GetModuleHandleW(NULL), NULL
         );
         update_font();
         SetTimer(hwnd, TIMER_EDGE, 100, NULL);
+        return 0;
+
+    case WM_SETFOCUS:
+        if (g_edit) {
+            SetFocus(g_edit);
+            SendMessageW(g_edit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+        }
         return 0;
 
     case WM_ERASEBKGND:
@@ -558,6 +569,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             begin_drag(DRAG_MOVE, HTCAPTION);
             return 0;
         }
+
+        if (g_edit) SetFocus(g_edit);
         return 0;
     }
 
@@ -667,6 +680,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         case IDM_CLEAR:
             SetWindowTextW(g_edit, L"");
+            SetFocus(g_edit);
             return 0;
         case IDM_EXIT:
             DestroyWindow(hwnd);
@@ -696,11 +710,21 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show) {
     (void)hPrev;
 
     int initialColor = 0;
+    int initialOffset = 0;
+
     WCHAR *colorArg = wcsstr(cmd, L"/color=");
     if (colorArg) {
         initialColor = _wtoi(colorArg + 7);
         if (initialColor < 0 || initialColor >= COLOR_PRESET_COUNT) initialColor = 0;
     }
+
+    WCHAR *offsetArg = wcsstr(cmd, L"/offset=");
+    if (offsetArg) {
+        initialOffset = _wtoi(offsetArg + 8);
+        if (initialOffset < 0) initialOffset = 0;
+        if (initialOffset > 8) initialOffset = 8;
+    }
+
     assign_preset_values(initialColor);
 
     g_bodyBrush = CreateSolidBrush(g_bodyColor);
@@ -716,20 +740,30 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show) {
     wc.lpszClassName = L"EdgeNoteBorderlessClass";
     RegisterClassExW(&wc);
 
+    int startX = 1100 + initialOffset * 28;
+    int startY = 180 + initialOffset * 28;
+
     g_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         wc.lpszClassName,
         L"EdgeNote",
         WS_POPUP | WS_CLIPCHILDREN,
-        1100, 180, 360, 430,
+        startX, startY, 360, 430,
         NULL, NULL, hInst, NULL
     );
 
     if (!g_hwnd) return 1;
 
     GetWindowRect(g_hwnd, &g_visibleRect);
-    ShowWindow(g_hwnd, show);
+    ShowWindow(g_hwnd, SW_SHOWNORMAL);
     UpdateWindow(g_hwnd);
+
+    SetForegroundWindow(g_hwnd);
+    SetActiveWindow(g_hwnd);
+    if (g_edit) {
+        SetFocus(g_edit);
+        SendMessageW(g_edit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    }
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
