@@ -1,9 +1,14 @@
 // EdgeNote - native Win32 sticky note for Windows 10/11 x64
-// True borderless window, manual resize, four-edge auto-hide, multi-instance.
+// True borderless window, manual resize, four-edge auto-hide, multi-instance,
+// per-note preset/custom colors.
 
 #include <windows.h>
 #include <windowsx.h>
+#include <commdlg.h>
 #include <stdlib.h>
+#include <wchar.h>
+
+#pragma comment(lib, "Comdlg32.lib")
 
 #define ID_EDIT 1001
 #define IDM_NEWNOTE 2000
@@ -14,6 +19,14 @@
 #define IDM_UNDOCK 2005
 #define IDM_CLEAR 2006
 #define IDM_EXIT 2007
+
+#define IDM_COLOR_YELLOW 2100
+#define IDM_COLOR_PINK   2101
+#define IDM_COLOR_BLUE   2102
+#define IDM_COLOR_GREEN  2103
+#define IDM_COLOR_PURPLE 2104
+#define IDM_COLOR_ORANGE 2105
+#define IDM_COLOR_CUSTOM 2110
 
 #define TIMER_EDGE 1
 #define EDGE_NONE 0
@@ -35,6 +48,22 @@
 #define DRAG_MOVE 1
 #define DRAG_SIZE 2
 
+#define COLOR_PRESET_COUNT 6
+
+typedef struct NoteColorPreset {
+    COLORREF body;
+    COLORREF title;
+} NoteColorPreset;
+
+static const NoteColorPreset g_presets[COLOR_PRESET_COUNT] = {
+    { RGB(247,229,142), RGB(228,201, 85) }, /* yellow */
+    { RGB(250,213,225), RGB(232,169,193) }, /* pink */
+    { RGB(211,231,250), RGB(154,194,232) }, /* blue */
+    { RGB(216,240,211), RGB(160,208,151) }, /* green */
+    { RGB(231,216,248), RGB(191,159,226) }, /* purple */
+    { RGB(252,224,190), RGB(235,181,113) }  /* orange */
+};
+
 static HWND g_hwnd = NULL;
 static HWND g_edit = NULL;
 static HBRUSH g_bodyBrush = NULL;
@@ -49,16 +78,19 @@ static int g_autoHide = 1;
 static int g_fontSize = 13;
 static int g_inMoveSize = 0;
 static int g_menuOpen = 0;
+static int g_spawnCount = 0;
 
 static int g_dragMode = DRAG_NONE;
 static int g_dragHit = HTCLIENT;
 static POINT g_dragStart = {0};
 static RECT g_dragRect = {0};
 
-static const COLORREF COL_BODY = RGB(247, 229, 142);
-static const COLORREF COL_TITLE = RGB(228, 201, 85);
-static const COLORREF COL_TEXT = RGB(47, 44, 30);
-static const COLORREF COL_TITLETEXT = RGB(81, 71, 17);
+static int g_colorIndex = 0; /* -1 means custom */
+static COLORREF g_bodyColor = RGB(247,229,142);
+static COLORREF g_titleColor = RGB(228,201,85);
+static COLORREF g_textColor = RGB(47,44,30);
+static COLORREF g_titleTextColor = RGB(81,71,17);
+static COLORREF g_customColors[16] = {0};
 
 static void get_monitor_info(HMONITOR mon, MONITORINFO *mi) {
     ZeroMemory(mi, sizeof(*mi));
@@ -75,6 +107,82 @@ static HMONITOR monitor_for_visible_rect(void) {
 
 static HWND z_after(void) {
     return g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
+}
+
+static COLORREF contrast_text(COLORREF c) {
+    int r = GetRValue(c);
+    int g = GetGValue(c);
+    int b = GetBValue(c);
+    int luminance = (299 * r + 587 * g + 114 * b) / 1000;
+    return luminance < 140 ? RGB(250,250,250) : RGB(47,44,30);
+}
+
+static COLORREF darken_color(COLORREF c) {
+    int r = (GetRValue(c) * 82) / 100;
+    int g = (GetGValue(c) * 82) / 100;
+    int b = (GetBValue(c) * 82) / 100;
+    return RGB(r, g, b);
+}
+
+static void assign_preset_values(int index) {
+    if (index < 0 || index >= COLOR_PRESET_COUNT) index = 0;
+    g_colorIndex = index;
+    g_bodyColor = g_presets[index].body;
+    g_titleColor = g_presets[index].title;
+    g_textColor = contrast_text(g_bodyColor);
+    g_titleTextColor = contrast_text(g_titleColor);
+}
+
+static void rebuild_color_brushes(void) {
+    HBRUSH newBody = CreateSolidBrush(g_bodyColor);
+    HBRUSH newTitle = CreateSolidBrush(g_titleColor);
+    if (!newBody || !newTitle) {
+        if (newBody) DeleteObject(newBody);
+        if (newTitle) DeleteObject(newTitle);
+        return;
+    }
+
+    HBRUSH oldBody = g_bodyBrush;
+    HBRUSH oldTitle = g_titleBrush;
+    g_bodyBrush = newBody;
+    g_titleBrush = newTitle;
+
+    if (g_hwnd) {
+        SetClassLongPtrW(g_hwnd, GCLP_HBRBACKGROUND, (LONG_PTR)g_bodyBrush);
+        InvalidateRect(g_hwnd, NULL, TRUE);
+        if (g_edit) InvalidateRect(g_edit, NULL, TRUE);
+    }
+
+    if (oldBody) DeleteObject(oldBody);
+    if (oldTitle) DeleteObject(oldTitle);
+}
+
+static void set_preset_color(int index) {
+    assign_preset_values(index);
+    rebuild_color_brushes();
+}
+
+static void set_custom_color(COLORREF body) {
+    g_colorIndex = -1;
+    g_bodyColor = body;
+    g_titleColor = darken_color(body);
+    g_textColor = contrast_text(g_bodyColor);
+    g_titleTextColor = contrast_text(g_titleColor);
+    rebuild_color_brushes();
+}
+
+static void choose_custom_color(HWND owner) {
+    CHOOSECOLORW cc;
+    ZeroMemory(&cc, sizeof(cc));
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = owner;
+    cc.rgbResult = g_bodyColor;
+    cc.lpCustColors = g_customColors;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+    g_menuOpen = 1;
+    if (ChooseColorW(&cc)) set_custom_color(cc.rgbResult);
+    g_menuOpen = 0;
 }
 
 static void update_font(void) {
@@ -100,7 +208,6 @@ static void layout_edit(void) {
     if (!g_edit) return;
     RECT cr;
     GetClientRect(g_hwnd, &cr);
-    /* Leave only a tiny invisible resize hit-zone around the content. */
     int pad = RESIZE_BORDER;
     int ew = cr.right - pad * 2;
     int eh = cr.bottom - TITLE_H - pad;
@@ -316,7 +423,14 @@ static void end_drag(void) {
 
 static void create_new_note(void) {
     WCHAR exe[MAX_PATH];
+    WCHAR command[MAX_PATH * 2];
     if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
+
+    int base = g_colorIndex >= 0 ? g_colorIndex : ((int)GetCurrentProcessId() % COLOR_PRESET_COUNT);
+    int nextColor = (base + 1 + g_spawnCount) % COLOR_PRESET_COUNT;
+    ++g_spawnCount;
+
+    wsprintfW(command, L"\"%s\" /color=%d", exe, nextColor);
 
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -324,7 +438,7 @@ static void create_new_note(void) {
     ZeroMemory(&pi, sizeof(pi));
     si.cb = sizeof(si);
 
-    if (CreateProcessW(exe, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+    if (CreateProcessW(exe, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
@@ -332,9 +446,24 @@ static void create_new_note(void) {
 
 static void show_menu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
-    if (!menu) return;
+    HMENU colors = CreatePopupMenu();
+    if (!menu || !colors) {
+        if (menu) DestroyMenu(menu);
+        if (colors) DestroyMenu(colors);
+        return;
+    }
+
+    AppendMenuW(colors, MF_STRING | (g_colorIndex == 0 ? MF_CHECKED : 0), IDM_COLOR_YELLOW, L"黄色");
+    AppendMenuW(colors, MF_STRING | (g_colorIndex == 1 ? MF_CHECKED : 0), IDM_COLOR_PINK,   L"粉色");
+    AppendMenuW(colors, MF_STRING | (g_colorIndex == 2 ? MF_CHECKED : 0), IDM_COLOR_BLUE,   L"蓝色");
+    AppendMenuW(colors, MF_STRING | (g_colorIndex == 3 ? MF_CHECKED : 0), IDM_COLOR_GREEN,  L"绿色");
+    AppendMenuW(colors, MF_STRING | (g_colorIndex == 4 ? MF_CHECKED : 0), IDM_COLOR_PURPLE, L"紫色");
+    AppendMenuW(colors, MF_STRING | (g_colorIndex == 5 ? MF_CHECKED : 0), IDM_COLOR_ORANGE, L"橙色");
+    AppendMenuW(colors, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(colors, MF_STRING | (g_colorIndex == -1 ? MF_CHECKED : 0), IDM_COLOR_CUSTOM, L"自定义颜色...");
 
     AppendMenuW(menu, MF_STRING, IDM_NEWNOTE, L"新建便签");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)colors, L"便签颜色");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (g_alwaysOnTop ? MF_CHECKED : 0), IDM_TOPMOST, L"总在最前");
     AppendMenuW(menu, MF_STRING | (g_autoHide ? MF_CHECKED : 0), IDM_AUTOHIDE, L"贴边自动隐藏");
@@ -386,7 +515,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         FillRect(dc, &tr, g_titleBrush);
 
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, COL_TITLETEXT);
+        SetTextColor(dc, g_titleTextColor);
 
         RECT title = {12, 0, cr.right - TITLE_BTN_W * 2 - 4, TITLE_H};
         DrawTextW(dc, L"便签", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -416,7 +545,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         RECT cr;
         GetClientRect(hwnd, &cr);
 
-        /* Buttons win over resize zones so the top-right stays easy to click. */
         if (y < TITLE_H && x >= cr.right - TITLE_BTN_W * 2)
             return 0;
 
@@ -494,6 +622,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_NEWNOTE:
             create_new_note();
             return 0;
+        case IDM_COLOR_YELLOW:
+            set_preset_color(0);
+            return 0;
+        case IDM_COLOR_PINK:
+            set_preset_color(1);
+            return 0;
+        case IDM_COLOR_BLUE:
+            set_preset_color(2);
+            return 0;
+        case IDM_COLOR_GREEN:
+            set_preset_color(3);
+            return 0;
+        case IDM_COLOR_PURPLE:
+            set_preset_color(4);
+            return 0;
+        case IDM_COLOR_ORANGE:
+            set_preset_color(5);
+            return 0;
+        case IDM_COLOR_CUSTOM:
+            choose_custom_color(hwnd);
+            return 0;
         case IDM_TOPMOST:
             g_alwaysOnTop = !g_alwaysOnTop;
             SetWindowPos(hwnd, z_after(), 0, 0, 0, 0,
@@ -526,8 +675,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
 
     case WM_CTLCOLOREDIT:
-        SetBkColor((HDC)wParam, COL_BODY);
-        SetTextColor((HDC)wParam, COL_TEXT);
+        SetBkColor((HDC)wParam, g_bodyColor);
+        SetTextColor((HDC)wParam, g_textColor);
         return (LRESULT)g_bodyBrush;
 
     case WM_DESTROY:
@@ -545,11 +694,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show) {
     (void)hPrev;
-    (void)cmd;
 
-    /* No mutex / single-instance gate: every launch creates another note. */
-    g_bodyBrush = CreateSolidBrush(COL_BODY);
-    g_titleBrush = CreateSolidBrush(COL_TITLE);
+    int initialColor = 0;
+    WCHAR *colorArg = wcsstr(cmd, L"/color=");
+    if (colorArg) {
+        initialColor = _wtoi(colorArg + 7);
+        if (initialColor < 0 || initialColor >= COLOR_PRESET_COUNT) initialColor = 0;
+    }
+    assign_preset_values(initialColor);
+
+    g_bodyBrush = CreateSolidBrush(g_bodyColor);
+    g_titleBrush = CreateSolidBrush(g_titleColor);
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -561,7 +716,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show) {
     wc.lpszClassName = L"EdgeNoteBorderlessClass";
     RegisterClassExW(&wc);
 
-    /* WS_POPUP only: no WS_THICKFRAME, so Windows draws no visible frame. */
     g_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         wc.lpszClassName,
