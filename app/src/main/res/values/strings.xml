@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Ticket Radar</string>
+    <string name="accessibility_desc">读取大麦当前前台页面的可访问控件，用于识别票档与正常购票按钮；遇到验证、排队、确认订单或支付时自动停止操作。</string>
+</resources>
